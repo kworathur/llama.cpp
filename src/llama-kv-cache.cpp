@@ -3049,6 +3049,38 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
+size_t llama_kv_cache_context::get_hsa_order_size(const llama_ubatch & ubatch, bool causal, uint32_t extent) const {
+    if (ubatch.n_tokens != 1 || !ubatch.seq_id || !ubatch.seq_id[0]) return extent;
+    const llama_seq_id seq_id=ubatch.seq_id[0][0];
+    const auto & cells=kv->get_cells(seq_id);
+    if (extent<cells.used_max_p1()) return get_hsa_order(ubatch,causal,extent).size();
+    const auto & positions=cells.seq_pos_get(seq_id);
+    if (positions.empty()) return extent;
+    size_t count=positions.size();
+    if (causal && positions.rbegin()->first>ubatch.pos[0]) count=std::distance(positions.begin(),positions.upper_bound({ubatch.pos[0],UINT32_MAX}));
+    return count ? std::min<size_t>(extent,GGML_PAD(count,64)) : extent;
+}
+
+std::vector<int32_t> llama_kv_cache_context::get_hsa_order(const llama_ubatch & ubatch, bool causal, uint32_t extent) const {
+    std::vector<int32_t> rows;
+    if (ubatch.n_tokens != 1 || !ubatch.seq_id || !ubatch.seq_id[0]) return std::vector<int32_t>(extent,0);
+    const llama_seq_id seq_id=ubatch.seq_id[0][0];
+    const auto & cells=kv->get_cells(seq_id);
+    std::vector<bool> used(extent,false);
+    for(const auto & entry:cells.seq_pos_get(seq_id)) {
+        if(entry.second>=extent || (causal && entry.first>ubatch.pos[0])) continue;
+        rows.push_back((int32_t)entry.second);
+        used[entry.second]=true;
+    }
+    // Full-cache graph reservation has no live cells yet.
+    if(rows.empty()) return std::vector<int32_t>(extent,0);
+    const size_t size=std::min<size_t>(extent,GGML_PAD(rows.size(),64));
+    int32_t pad=0;
+    for(uint32_t i=0;i<extent;++i) if(!used[i]) { pad=(int32_t)i; break; }
+    rows.resize(size,pad);
+    return rows;
+}
+
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }

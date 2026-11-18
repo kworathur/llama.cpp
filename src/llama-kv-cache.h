@@ -418,6 +418,8 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
+    std::vector<int32_t> get_hsa_order(const llama_ubatch & ubatch, bool causal, uint32_t extent) const;
+    size_t get_hsa_order_size(const llama_ubatch & ubatch, bool causal, uint32_t extent) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

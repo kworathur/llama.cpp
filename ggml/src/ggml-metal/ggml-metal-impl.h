@@ -1449,4 +1449,12 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+typedef struct {
+    int32_t D, H, Hkv, N, chunk, r;
+    uint64_t nb0, nb1, nb2;
+    int32_t k_f16;
+    uint64_t vb0, vb1, vb2;
+    int32_t v_f16;
+} ggml_metal_kargs_hsa;
+
 #endif // GGML_METAL_IMPL

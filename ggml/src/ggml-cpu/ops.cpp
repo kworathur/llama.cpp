@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -12482,6 +12483,205 @@ void ggml_compute_forward_lightning_indexer(
                 }
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_hsa(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * src = dst->src[0];
+    const int mode = dst->op_params[0];
+    if (mode == 6) {
+        auto * maximum=dst->src[0];auto * minimum=dst->src[1];const auto * k=dst->src[2];
+        const auto * order=(const int32_t *)dst->src[3]->data;const auto * mask=(const float *)dst->src[4]->data;
+        const int D=k->ne[0],Hkv=k->ne[1],N=dst->src[3]->ne[0],chunk=dst->op_params[1];
+        int live=N;while(live>0 && !std::isfinite(mask[order[live-1]])) --live;
+        if(live==0) return;
+        const bool last=dst->op_params[2];const int C=last ? 1 : (N+chunk-1)/chunk;
+        for(int task=params->ith;task<C*Hkv*D;task+=params->nth) {
+            const int d=task%D,h=(task/D)%Hkv,c=last ? (live-1)/chunk : task/(D*Hkv);
+            float hi=-INFINITY,lo=INFINITY;
+            for(int t=c*chunk;t<std::min(live,(c+1)*chunk);++t) {
+                const char * p=(const char *)k->data+order[t]*k->nb[2]+h*k->nb[1]+d*k->nb[0];
+                float value=k->type==GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)p) : *(const float *)p;
+                hi=std::max(hi,value);lo=std::min(lo,value);
+            }
+            char * pmax=(char *)maximum->data+h*maximum->nb[2]+c*maximum->nb[1]+d*maximum->nb[0];
+            char * pmin=(char *)minimum->data+h*minimum->nb[2]+c*minimum->nb[1]+d*minimum->nb[0];
+            if(maximum->type==GGML_TYPE_F16) { *(ggml_fp16_t *)pmax=GGML_FP32_TO_FP16(hi);*(ggml_fp16_t *)pmin=GGML_FP32_TO_FP16(lo); }
+            else { *(float *)pmax=hi;*(float *)pmin=lo; }
+        }
+    } else if (mode == 7 || mode == 8) {
+        const int D=src->ne[0],H=src->ne[1]-1,Hkv=src->ne[2],C=dst->ne[0],N=dst->src[3]->ne[0],chunk=dst->op_params[1];
+        const auto * maximum=dst->src[1];const auto * minimum=dst->src[2];
+        const auto * order=(const int32_t *)dst->src[3]->data;const auto * mask=(const float *)dst->src[4]->data;
+        const auto * meta=(const float *)src->data;auto * out=(float *)dst->data;
+        for(int task=params->ith;task<C*Hkv;task+=params->nth) {
+            int kv=task/C,c=task%C,count=0;
+            for(int t=c*chunk;t<std::min(N,(c+1)*chunk);++t) count+=std::isfinite(mask[order[t]]);
+            out[(kv*(H+1)+H)*C+c]=count;
+            if(mode==8 && count && ((c+1)*chunk>=N || !std::isfinite(mask[order[(c+1)*chunk]]))) {
+                const auto * k=dst->src[5];
+                for(int d=0;d<D;++d) {
+                    float hi=-INFINITY,lo=INFINITY;
+                    for(int t=c*chunk;t<std::min(N,(c+1)*chunk);++t) {
+                        if(!std::isfinite(mask[order[t]])) continue;
+                        const char * p=(const char *)k->data+order[t]*k->nb[2]+kv*k->nb[1]+d*k->nb[0];
+                        float value=k->type==GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)p) : *(const float *)p;
+                        hi=std::max(hi,value);lo=std::min(lo,value);
+                    }
+                    char * pmax=(char *)maximum->data+kv*maximum->nb[2]+c*maximum->nb[1]+d*maximum->nb[0];
+                    char * pmin=(char *)minimum->data+kv*minimum->nb[2]+c*minimum->nb[1]+d*minimum->nb[0];
+                    if(maximum->type==GGML_TYPE_F16) { *(ggml_fp16_t *)pmax=GGML_FP32_TO_FP16(hi);*(ggml_fp16_t *)pmin=GGML_FP32_TO_FP16(lo); }
+                    else { *(float *)pmax=hi;*(float *)pmin=lo; }
+                }
+            }
+            for(int h=0;h<H;++h) {
+                float value=0.f;
+                if(count) for(int d=0;d<D;++d) {
+                    float sign=meta[(kv*(H+1)+H)*D+d];
+                    if(sign==0.f) continue;
+                    const auto * t=sign>0 ? maximum : minimum;
+                    const char * p=(const char *)t->data+kv*t->nb[2]+c*t->nb[1]+d*t->nb[0];
+                    float bound=t->type==GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)p) : *(const float *)p;
+                    value+=meta[(kv*(H+1)+h)*D+d]*(sign>0 ? bound : -bound);
+                }
+                out[(kv*(H+1)+h)*C+c]=count ? value : -INFINITY;
+            }
+        }
+    } else if (mode == 5) {
+        const int C=src->ne[0], H=src->ne[1]-1, Hkv=src->ne[2], keep=dst->op_params[1], chunk=dst->op_params[2];
+        const auto * logits=(const float *)src->data;
+        for(int kv=params->ith;kv<Hkv;kv+=params->nth) {
+            const float * counts=logits+(kv*(H+1)+H)*C;
+            auto * scores=(float *)dst->data+kv*(C+keep);
+            auto * rows=(int32_t *)dst->data+kv*(C+keep)+C;
+            for(int c=0;c<C;++c) scores[c]=0.f;
+            for(int h=0;h<H;++h) {
+                const float * row=logits+(kv*(H+1)+h)*C;
+                float mx=-INFINITY,sum=0.f;
+                for(int c=0;c<C;++c) mx=std::max(mx,row[c]);
+                for(int c=0;c<C;++c) sum+=expf(row[c]-mx)*counts[c];
+                for(int c=0;c<C;++c) scores[c]+=expf(row[c]-mx)/(sum*H);
+            }
+            int live=0;
+            for(int c=0;c<C;++c) live+=(int)counts[c];
+            std::vector<int32_t> indices(live);
+            for(int i=0;i<live;++i) indices[i]=i;
+            const int k=std::min(keep,live);
+            std::partial_sort(indices.begin(),indices.begin()+k,indices.end(),[&](int a,int b) {
+                return scores[a/chunk] != scores[b/chunk] ? scores[a/chunk]>scores[b/chunk] : a<b;
+            });
+            for(int i=0;i<keep;++i) rows[i]=i<k ? indices[i] : dst->op_params[3]-1;
+        }
+    } else if (mode == 4) {
+        const auto * k = dst->src[0]; const auto * v = dst->src[1];
+        const auto * order = (const int32_t *)dst->src[2]->data;
+        const auto * rows = (const int32_t *)dst->src[3]->data;
+        const auto * mask = (const float *)dst->src[4]->data;
+        const int D = k->ne[0], Hkv = k->ne[1], keep = dst->src[3]->ne[0];
+        const size_t block = (size_t) D*keep*Hkv;
+        auto * out = (ggml_fp16_t *)dst->data;
+        for (int i = params->ith; i < keep*Hkv; i += params->nth) {
+            int kv = i/keep, t = i%keep;
+            const auto * row_ids=(const int32_t *)((const char *)rows+kv*dst->src[3]->nb[1]);
+            int row=order[row_ids[t]];
+            out[2*block+i] = GGML_FP32_TO_FP16(mask[row]);
+            for (int d = 0; d < D; ++d) {
+                if (!std::isfinite(mask[row])) {
+                    out[(kv*keep+t)*D+d] = GGML_FP32_TO_FP16(0.f);
+                    out[block+(kv*keep+t)*D+d] = GGML_FP32_TO_FP16(0.f);
+                    continue;
+                }
+                const char * pk = (const char *)k->data + row*k->nb[2]+kv*k->nb[1]+d*k->nb[0];
+                const char * pv = (const char *)v->data + row*v->nb[2]+kv*v->nb[1]+d*v->nb[0];
+                out[(kv*keep+t)*D+d] = k->type == GGML_TYPE_F16 ? *(const ggml_fp16_t *)pk : GGML_FP32_TO_FP16(*(const float *)pk);
+                out[block+(kv*keep+t)*D+d] = v->type == GGML_TYPE_F16 ? *(const ggml_fp16_t *)pv : GGML_FP32_TO_FP16(*(const float *)pv);
+            }
+        }
+    } else if (mode == 0) {
+        if (params->ith != 0) return;
+        const float * mask = (const float *) src->data;
+        int32_t * order = (int32_t *) dst->data;
+        int live = 0, invalid = 0;
+        for (int t = 0; t < src->ne[0]; ++t) {
+            if (std::isfinite(mask[t])) order[live++] = t;
+            else invalid = t;
+        }
+        for (int t = live; t < src->ne[0]; ++t) order[t] = invalid;
+    } else if (mode == 1) {
+        const int D = dst->ne[0], H = dst->ne[1]-1, Hkv = dst->ne[2], r = dst->op_params[1];
+        const float * q = (const float *) src->data;
+        float * out = (float *) dst->data;
+        for (int kv = params->ith; kv < Hkv; kv += params->nth) {
+            float importance[256], signs[256];
+            GGML_ASSERT(D <= 256);
+            for (int d = 0; d < D; ++d) {
+                float imp = 0, sum = 0;
+                for (int h = 0; h < H; ++h) { float v = q[(kv*H+h)*D+d]; imp += fabsf(v); sum += v; }
+                importance[d] = imp;
+                signs[d] = sum > 0 ? 1.f : -1.f;
+            }
+            for (int d = 0; d < D; ++d) {
+                int rank = 0;
+                for (int j = 0; j < D; ++j) rank += importance[j] > importance[d] || (importance[j] == importance[d] && j < d);
+                out[(kv*(H+1)+H)*D+d] = rank < r ? signs[d] : 0.f;
+            }
+            for (int h = 0; h < H; ++h) {
+                float all = 0, kept = 0;
+                for (int d = 0; d < D; ++d) { float a = fabsf(q[(kv*H+h)*D+d]); all += a; if (out[(kv*(H+1)+H)*D+d] != 0) kept += a; }
+                float scale = sqrtf(D*kept/all);
+                for (int d = 0; d < D; ++d) out[(kv*(H+1)+h)*D+d] = q[(kv*H+h)*D+d] * out[(kv*(H+1)+H)*D+d] / scale;
+            }
+        }
+    } else if (mode == 3) {
+        const int C=src->ne[0], H=src->ne[1]-1, Hkv=src->ne[2], N=dst->ne[0], chunk=dst->op_params[1];
+        const float * logits=(const float *)src->data;
+        float * out=(float *)dst->data;
+        for (int kv=params->ith;kv<Hkv;kv+=params->nth) {
+            const float * counts=logits+(kv*(H+1)+H)*C;
+            for(int c=0;c<C;++c) out[kv*N+c*chunk]=0.f;
+            for(int h=0;h<H;++h) {
+                const float * row=logits+(kv*(H+1)+h)*C;
+                float mx=-INFINITY,sum=0.f;
+                for(int c=0;c<C;++c) mx=std::max(mx,row[c]);
+                for(int c=0;c<C;++c) sum+=expf(row[c]-mx)*counts[c];
+                for(int c=0;c<C;++c) out[kv*N+c*chunk]+=expf(row[c]-mx)/(sum*H);
+            }
+            for(int c=0;c<C;++c) {
+                float value=out[kv*N+c*chunk];
+                for(int j=0;j<chunk && c*chunk+j<N;++j) out[kv*N+c*chunk+j]=j < (int)counts[c] ? value : -INFINITY;
+            }
+        }
+    } else {
+        const int D = src->ne[0], H = src->ne[1]-1, Hkv = src->ne[2], N = dst->src[2]->ne[0], chunk = dst->op_params[1];
+        const auto * k = dst->src[1];
+        const auto * order = (const int32_t *) dst->src[2]->data;
+        const auto * mask = (const float *) dst->src[3]->data;
+        const auto * meta = (const float *) src->data;
+        auto * out = (float *) dst->data;
+        const int C = (N+chunk-1)/chunk;
+        for (int task = params->ith; task < C*Hkv; task += params->nth) {
+            int kv = task/C, c = task%C;
+            float maxima[256];
+            for (int d = 0; d < D; ++d) {
+                float sign = meta[(kv*(H+1)+H)*D+d], mx = -INFINITY;
+                if (sign != 0) for (int t = c*chunk; t < std::min(N,(c+1)*chunk); ++t) {
+                    int row = order[t];
+                    if (!std::isfinite(mask[row])) continue;
+                    const char * ptr = (const char *) k->data + row*k->nb[2] + kv*k->nb[1] + d*k->nb[0];
+                    float value = k->type == GGML_TYPE_F32 ? *(const float *) ptr : GGML_FP16_TO_FP32(*(const ggml_fp16_t *) ptr);
+                    mx = std::max(mx, sign*value);
+                }
+                maxima[d] = std::isfinite(mx) ? mx : 0.f;
+            }
+            int count=0;
+            for(int t=c*chunk;t<std::min(N,(c+1)*chunk);++t) count+=std::isfinite(mask[order[t]]);
+            out[(kv*(H+1)+H)*C+c]=count;
+            for (int h = 0; h < H; ++h) {
+                float dot = 0;
+                for (int d = 0; d < D; ++d) dot += meta[(kv*(H+1)+h)*D+d] * maxima[d];
+                out[(kv*(H+1)+h)*C+c]=count ? dot : -INFINITY;
             }
         }
     }

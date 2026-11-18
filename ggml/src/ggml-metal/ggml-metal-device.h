@@ -382,3 +382,5 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 #ifdef __cplusplus
 }
 #endif
+
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hsa(ggml_metal_library_t lib, int mode, int heads);

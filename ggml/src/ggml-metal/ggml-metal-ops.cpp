@@ -462,6 +462,8 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_roll(ctx, idx);
             } break;
+        case GGML_OP_HSA:
+            { n_fuse = ggml_metal_op_hsa(ctx, idx); } break;
         case GGML_OP_ARANGE:
             {
                 n_fuse = ggml_metal_op_arange(ctx, idx);
@@ -6352,5 +6354,61 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
     }
 
+    return 1;
+}
+
+int ggml_metal_op_hsa(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const int mode = op->op_params[0];
+    ggml_metal_kargs_hsa args = {};
+    args.N = op->ne[0];
+    if (mode == 6) {
+        args.D=op->src[2]->ne[0];args.Hkv=op->src[2]->ne[1];args.N=op->src[3]->ne[0];args.H=op->ne[1];
+        args.chunk=op->op_params[1];args.r=op->op_params[2];
+        args.nb0=op->src[2]->nb[0];args.nb1=op->src[2]->nb[1];args.nb2=op->src[2]->nb[2];
+        args.vb0=op->nb[0];args.vb1=op->nb[1];args.vb2=op->nb[2];
+        args.k_f16=op->src[2]->type==GGML_TYPE_F16;args.v_f16=op->type==GGML_TYPE_F16;
+    } else if (mode == 7 || mode == 8) {
+        args.D=op->src[0]->ne[0];args.H=op->ne[1]-1;args.Hkv=op->ne[2];args.N=op->src[3]->ne[0];args.chunk=op->op_params[1];
+        args.nb0=op->src[1]->nb[0];args.nb1=op->src[1]->nb[1];args.nb2=op->src[1]->nb[2];args.k_f16=op->src[1]->type==GGML_TYPE_F16;
+        if(mode==8) {
+            args.r=1;args.vb0=op->src[5]->nb[0];args.vb1=op->src[5]->nb[1];args.vb2=op->src[5]->nb[2];args.v_f16=op->src[5]->type==GGML_TYPE_F16;
+        }
+    } else if (mode == 5) {
+        args.N=op->src[0]->ne[0]; args.H=op->src[0]->ne[1]-1; args.Hkv=op->ne[1];
+        args.D=op->op_params[1]; args.chunk=op->op_params[2]; args.r=op->op_params[3];
+    } else if (mode == 4) {
+        args.H=op->src[3]->nb[1]/sizeof(int32_t);
+        args.D = op->src[0]->ne[0]; args.Hkv = op->src[0]->ne[1]; args.N = op->src[3]->ne[0];
+        args.nb0 = op->src[0]->nb[0]; args.nb1 = op->src[0]->nb[1]; args.nb2 = op->src[0]->nb[2];
+        args.vb0 = op->src[1]->nb[0]; args.vb1 = op->src[1]->nb[1]; args.vb2 = op->src[1]->nb[2];
+        args.k_f16 = op->src[0]->type == GGML_TYPE_F16; args.v_f16 = op->src[1]->type == GGML_TYPE_F16;
+    } else if (mode == 3) {
+        args.D=op->ne[0]; args.N=op->src[0]->ne[0]; args.chunk=op->op_params[1];
+        args.H = op->src[0]->ne[1]-1; args.Hkv = op->ne[1];
+    } else if (mode == 1) {
+        args.D = op->ne[0]; args.H = op->ne[1]-1; args.Hkv = op->ne[2]; args.r = op->op_params[1];
+    } else if (mode == 2) {
+        args.D = op->src[0]->ne[0]; args.H = op->ne[1]-1; args.Hkv = op->ne[2]; args.N = op->src[2]->ne[0]; args.chunk = op->op_params[1];
+        args.nb0 = op->src[1]->nb[0]; args.nb1 = op->src[1]->nb[1]; args.nb2 = op->src[1]->nb[2];
+        args.k_f16 = op->src[1]->type == GGML_TYPE_F16;
+    }
+    auto pipeline = ggml_metal_library_get_pipeline_hsa(ctx->lib,mode,args.H);
+    ggml_metal_encoder_set_pipeline(ctx->enc,pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc,&args,sizeof(args),0);
+    ggml_metal_encoder_set_buffer(ctx->enc,ggml_metal_get_buffer_id(op->src[0]),1);
+    int slot = 2;
+    const int nsrc=mode==8 ? 6 : mode==2 ? 4 : mode==4 || mode==6 || mode==7 ? 5 : 1;
+    for(int i=1;i<nsrc;++i) ggml_metal_encoder_set_buffer(ctx->enc,ggml_metal_get_buffer_id(op->src[i]),slot++);
+    if(mode==7) ggml_metal_encoder_set_buffer(ctx->enc,ggml_metal_get_buffer_id(op->src[1]),slot++);
+    ggml_metal_encoder_set_buffer(ctx->enc,ggml_metal_get_buffer_id(op),slot);
+    if(mode==6) {
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc,args.r ? 1 : (args.N+args.chunk-1)/args.chunk,args.Hkv,1,256,1,1);
+    } else if(mode==7 || mode==8) {
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc,((args.N+args.chunk-1)/args.chunk+3)/4,args.Hkv,1,128,1,1);
+    } else {
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc,mode == 4 ? args.N : mode == 2 ? ((args.N+args.chunk-1)/args.chunk+3)/4 : (mode == 1 || mode == 3 || mode == 5 ? args.Hkv : 1),
+            mode == 2 || mode == 4 ? args.Hkv : 1,1,mode == 4 ? 64 : mode == 2 ? 128 : 256,1,1);
+    }
     return 1;
 }

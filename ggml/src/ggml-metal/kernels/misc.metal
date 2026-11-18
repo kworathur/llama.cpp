@@ -1002,3 +1002,434 @@ typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_f_t;
 
 template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
+
+// All HSA kernels keep selection on the GPU; no last-layer or previous-step state.
+inline float hsa_sum(float v, threadgroup float * scratch, uint lane, uint sg) {
+    float sum = simd_sum(v);
+    if (lane == 0) scratch[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        sum = simd_sum(lane < 8 ? scratch[lane] : 0.f);
+        if (lane == 0) scratch[0] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result = scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return result;
+}
+
+kernel void kernel_hsa_compact(
+        constant ggml_metal_kargs_hsa & a,
+        device const float * mask,
+        device int * order,
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint offsets[8];
+    threadgroup uint count, base;
+    threadgroup int invalid;
+    if (tid == 0) { count = 0; invalid = 0; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int start = 0; start < a.N; start += 256) {
+        int t = start + tid;
+        uint valid = t < a.N && isfinite(mask[t]);
+        uint prefix = simd_prefix_exclusive_sum(valid);
+        uint total = simd_sum(valid);
+        if (lane == 0) offsets[sg] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            base = count;
+            uint n = 0;
+            for (int s = 0; s < 8; ++s) { uint v = offsets[s]; offsets[s] = n; n += v; }
+            count += n;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) order[base + offsets[sg] + prefix] = t;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0 && count < uint(a.N)) {
+        for (int t = 0; t < a.N; ++t) if (!isfinite(mask[t])) { invalid = t; break; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = count + tid; t < uint(a.N); t += 256) order[t] = invalid;
+}
+
+kernel void kernel_hsa_query(
+        constant ggml_metal_kargs_hsa & a,
+        device const float * q,
+        device float * out,
+        uint kv [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float importance[256], sign[256];
+    if (tid < uint(a.D)) {
+        float imp = 0, sum = 0;
+        for (int h = 0; h < a.H; ++h) { float v = q[(kv*a.H+h)*a.D+tid]; imp += abs(v); sum += v; }
+        importance[tid] = imp;
+        sign[tid] = sum > 0 ? 1.f : -1.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < uint(a.D)) {
+        int rank = 0;
+        for (int j = 0; j < a.D; ++j) rank += importance[j] > importance[tid] || (importance[j] == importance[tid] && j < int(tid));
+        if (rank >= a.r) sign[tid] = 0.f;
+        out[(kv*(a.H+1)+a.H)*a.D+tid] = sign[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each SIMD group normalizes one query head independently.
+    for (uint h = sg; h < uint(a.H); h += 8) {
+        float total = 0.f, kept = 0.f;
+        for (uint d = lane; d < uint(a.D); d += 32) {
+            float value = abs(q[(kv*a.H+h)*a.D+d]);
+            total += value;
+            if (sign[d] != 0.f) kept += value;
+        }
+        total = simd_sum(total);
+        kept = simd_sum(kept);
+        float scale = sqrt(a.D*kept/total);
+        for (uint d = lane; d < uint(a.D); d += 32) out[(kv*(a.H+1)+h)*a.D+d] = q[(kv*a.H+h)*a.D+d]*sign[d]/scale;
+    }
+
+}
+
+template <ushort NH>
+kernel void kernel_hsa_logits(
+        constant ggml_metal_kargs_hsa & a,
+        device const float * query,
+        device const char * k,
+        device const int * order,
+        device const float * mask,
+        device float * out,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    const int H = NH == 0 ? a.H : NH;
+    // Four independent SIMD groups score four chunks per threadgroup.
+    int kv = group.y, start = (group.x*4+sg)*a.chunk, end = min(a.N,start+a.chunk);
+    if (start >= a.N) return;
+    int C=(a.N+a.chunk-1)/a.chunk, c=start/a.chunk;
+    if (lane==0) {
+        int count=0;
+        for(int t=start;t<end;++t) count+=isfinite(mask[order[t]]);
+        out[(kv*(a.H+1)+a.H)*C+c]=count;
+    }
+    if (!isfinite(mask[order[start]])) {
+        if(lane==0) for (int h=0;h<H;++h) out[(kv*(a.H+1)+h)*C+c]=-INFINITY;
+        return;
+    }
+    float dots[NH == 0 ? 32 : NH];
+    for (int h = 0; h < H; ++h) dots[h] = 0.f;
+    if (a.D % 4 == 0) {
+        // Adjacent dimensions are contiguous; vector loads avoid sparse scalar reads.
+        for (int d = 4*lane; d < a.D; d += 128) {
+            float4 sign = *(device const float4 *)(query+(kv*(a.H+1)+a.H)*a.D+d);
+            float4 mx = float4(-INFINITY);
+            for (int t = start; t < end; ++t) {
+                int row = order[t];
+                if (!isfinite(mask[row])) continue;
+                device const char * ptr = k+row*a.nb2+kv*a.nb1+d*a.nb0;
+                float4 value = a.k_f16 ? float4(*(device const half4 *)ptr) : *(device const float4 *)ptr;
+                mx = max(mx,sign*value);
+            }
+            for (int h = 0; h < H; ++h) dots[h] += dot(mx,*(device const float4 *)(query+(kv*(a.H+1)+h)*a.D+d));
+        }
+    } else {
+    for (int d = lane; d < a.D; d += 32) {
+        float sign = query[(kv*(a.H+1)+a.H)*a.D+d];
+        if (sign == 0.f) continue;
+        float mx = -INFINITY;
+        for (int t = start; t < end; ++t) {
+            int row = order[t];
+            if (!isfinite(mask[row])) continue;
+            device const char * ptr = k + row*a.nb2 + kv*a.nb1 + d*a.nb0;
+            float value = a.k_f16 ? float(*(device const half *)ptr) : *(device const float *)ptr;
+            mx = max(mx,sign*value);
+        }
+        for (int h = 0; h < H; ++h) dots[h] += mx*query[(kv*(a.H+1)+h)*a.D+d];
+    }
+    }
+    for (int h = 0; h < H; ++h) {
+        float dot = simd_sum(dots[h]);
+        if(lane==0) out[(kv*(a.H+1)+h)*C+c]=dot;
+    }
+    (void)tid;
+}
+
+typedef decltype(kernel_hsa_logits<0>) kernel_hsa_logits_t;
+template [[host_name("kernel_hsa_logits_h0")]] kernel kernel_hsa_logits_t kernel_hsa_logits<0>;
+template [[host_name("kernel_hsa_logits_h1")]] kernel kernel_hsa_logits_t kernel_hsa_logits<1>;
+template [[host_name("kernel_hsa_logits_h2")]] kernel kernel_hsa_logits_t kernel_hsa_logits<2>;
+template [[host_name("kernel_hsa_logits_h3")]] kernel kernel_hsa_logits_t kernel_hsa_logits<3>;
+template [[host_name("kernel_hsa_logits_h4")]] kernel kernel_hsa_logits_t kernel_hsa_logits<4>;
+template [[host_name("kernel_hsa_logits_h8")]] kernel kernel_hsa_logits_t kernel_hsa_logits<8>;
+template [[host_name("kernel_hsa_logits_h16")]] kernel kernel_hsa_logits_t kernel_hsa_logits<16>;
+template [[host_name("kernel_hsa_logits_h32")]] kernel kernel_hsa_logits_t kernel_hsa_logits<32>;
+
+inline float hsa_max(float v, threadgroup float * scratch, uint lane, uint sg) {
+    float value = simd_max(v);
+    if (lane == 0) scratch[sg] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        value = simd_max(lane < 8 ? scratch[lane] : -INFINITY);
+        if (lane == 0) scratch[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result = scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return result;
+}
+
+kernel void kernel_hsa_scores(
+        constant ggml_metal_kargs_hsa & a,
+        device const float * logits,
+        device float * out,
+        uint kv [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    device const float * counts=logits+(kv*(a.H+1)+a.H)*a.N;
+    for(int c=tid;c<a.N;c+=256) out[kv*a.D+c*a.chunk]=0.f;
+    for(int h=0;h<a.H;++h) {
+        device const float * row=logits+(kv*(a.H+1)+h)*a.N;
+        float mx=-INFINITY;
+        for(int c=tid;c<a.N;c+=256) mx=max(mx,row[c]);
+        mx=hsa_max(mx,scratch,lane,sg);
+        float sum=0.f;
+        for(int c=tid;c<a.N;c+=256) sum+=exp(row[c]-mx)*counts[c];
+        sum=hsa_sum(sum,scratch,lane,sg);
+        for(int c=tid;c<a.N;c+=256) out[kv*a.D+c*a.chunk]+=exp(row[c]-mx)/(sum*a.H);
+    }
+    for(int c=tid;c<a.N;c+=256) {
+        float value=out[kv*a.D+c*a.chunk];
+        for(int j=0;j<a.chunk && c*a.chunk+j<a.D;++j) out[kv*a.D+c*a.chunk+j]=j < int(counts[c]) ? value : -INFINITY;
+    }
+}
+
+kernel void kernel_hsa_gather(
+        constant ggml_metal_kargs_hsa & a,
+        device const char * k,
+        device const char * v,
+        device const int * order,
+        device const int * rows,
+        device const float * mask,
+        device half * out,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    int i = group.y*a.N+group.x, row = order[rows[group.y*a.H+group.x]];
+    int block = a.D*a.N*a.Hkv;
+    if (tid == 0) out[2*block+i] = half(mask[row]);
+    for (int d = tid; d < a.D; d += 64) {
+        if (!isfinite(mask[row])) {
+            out[i*a.D+d] = half(0.f);
+            out[block+i*a.D+d] = half(0.f);
+            continue;
+        }
+        device const char * pk = k + row*a.nb2 + group.y*a.nb1 + d*a.nb0;
+        device const char * pv = v + row*a.vb2 + group.y*a.vb1 + d*a.vb0;
+        out[i*a.D+d] = a.k_f16 ? *(device const half *)pk : half(*(device const float *)pk);
+        out[block+i*a.D+d] = a.v_f16 ? *(device const half *)pv : half(*(device const float *)pv);
+    }
+}
+
+
+// Weighted radix selection treats a chunk as count identical token scores.
+// Output starts with C scratch floats followed by keep compact row indices.
+kernel void kernel_hsa_select(
+        constant ggml_metal_kargs_hsa & a,
+        device const float * logits,
+        device int * packed,
+        uint kv [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    threadgroup atomic_uint histogram[256], emitted;
+    threadgroup uint bucket, above, n_above;
+    device float * scores=(device float *)(packed+kv*(a.N+a.D));
+    device int * rows=packed+kv*(a.N+a.D)+a.N;
+    device const float * counts=logits+(kv*(a.H+1)+a.H)*a.N;
+    float n_live=0.f;
+    for(int c=tid;c<a.N;c+=256) { scores[c]=0.f; n_live+=counts[c]; }
+    uint k=min(uint(a.D),uint(hsa_sum(n_live,scratch,lane,sg)));
+    if(k==0) {
+        for(int i=tid;i<a.D;i+=256) rows[i]=a.r-1;
+        return;
+    }
+    for(int h=0;h<a.H;++h) {
+        device const float * row=logits+(kv*(a.H+1)+h)*a.N;
+        float mx=-INFINITY;
+        for(int c=tid;c<a.N;c+=256) mx=max(mx,row[c]);
+        mx=hsa_max(mx,scratch,lane,sg);
+        float sum=0.f;
+        for(int c=tid;c<a.N;c+=256) sum+=exp(row[c]-mx)*counts[c];
+        sum=hsa_sum(sum,scratch,lane,sg);
+        for(int c=tid;c<a.N;c+=256) scores[c]+=exp(row[c]-mx)/(sum*a.H);
+    }
+    threadgroup_barrier(mem_flags::mem_device|mem_flags::mem_threadgroup);
+    uint prefix=0,desired=k;
+    for(int shift=24;shift>=0;shift-=8) {
+        atomic_store_explicit(&histogram[tid],0u,memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint hi_mask=shift==24 ? 0u : (0xFFFFFFFFu << uint(shift+8));
+        for(int c=tid;c<a.N;c+=256) {
+            uint key=as_type<uint>(scores[c]),count=uint(counts[c]);
+            if(count && (key & hi_mask)==(prefix & hi_mask)) atomic_fetch_add_explicit(&histogram[(key>>uint(shift)) & 255u],count,memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(tid<32) {
+            uint top=255-8*tid,sum=0,values[8];
+            for(uint j=0;j<8;++j) { values[j]=atomic_load_explicit(&histogram[top-j],memory_order_relaxed); sum+=values[j]; }
+            uint acc=simd_prefix_exclusive_sum(sum);
+            const simd_vote::vote_t hit=simd_vote::vote_t(simd_ballot(acc+sum>=desired));
+            if(tid==uint(ctz(hit))) {
+                uint b=top;
+                for(uint j=0;j<8;++j) {
+                    if(acc+values[j]>=desired) { b=top-j; break; }
+                    acc+=values[j];
+                }
+                bucket=b; above=acc;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix|=bucket<<uint(shift);
+        desired-=above;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if(tid==0) atomic_store_explicit(&emitted,0u,memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(int c=tid;c<a.N;c+=256) {
+        uint count=uint(counts[c]);
+        if(count && as_type<uint>(scores[c])>prefix) {
+            uint start=atomic_fetch_add_explicit(&emitted,count,memory_order_relaxed);
+            for(uint j=0;j<count;++j) rows[start+j]=c*a.chunk+j;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0) { n_above=atomic_load_explicit(&emitted,memory_order_relaxed); atomic_store_explicit(&emitted,0u,memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(int c=tid;c<a.N;c+=256) {
+        uint count=uint(counts[c]);
+        if(count && as_type<uint>(scores[c])==prefix) {
+            uint start=n_above+atomic_fetch_add_explicit(&emitted,count,memory_order_relaxed);
+            for(uint j=0;j<count && start+j<k;++j) rows[start+j]=c*a.chunk+j;
+        }
+    }
+    for(uint i=k+tid;i<uint(a.D);i+=256) rows[i]=a.r-1;
+}
+
+
+kernel void kernel_hsa_bounds(
+        constant ggml_metal_kargs_hsa & a,
+        device const char * previous,
+        device char * minimum,
+        device const char * keys,
+        device const int * order,
+        device const float * mask,
+        device char * maximum,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup int live;
+    if(tid==0) {
+        int n=a.N;
+        while(n>0 && !isfinite(mask[order[n-1]])) --n;
+        live=n;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(live==0) return;
+    int c=a.r ? (live-1)/a.chunk : int(group.x), kv=group.y;
+    for(int d=tid;d<a.D;d+=256) {
+        float hi=-INFINITY,lo=INFINITY;
+        for(int t=c*a.chunk;t<min(live,(c+1)*a.chunk);++t) {
+            device const char * ptr=keys+order[t]*a.nb2+kv*a.nb1+d*a.nb0;
+            float value=a.k_f16 ? float(*(device const half *)ptr) : *(device const float *)ptr;
+            hi=max(hi,value);lo=min(lo,value);
+        }
+        uint64_t offset=kv*a.vb2+c*a.vb1+d*a.vb0;
+        if(a.v_f16) { *(device half *)(maximum+offset)=half(hi);*(device half *)(minimum+offset)=half(lo); }
+        else { *(device float *)(maximum+offset)=hi;*(device float *)(minimum+offset)=lo; }
+    }
+    (void)previous;
+}
+
+template <ushort NH>
+kernel void kernel_hsa_bounds_logits(
+        constant ggml_metal_kargs_hsa & a,
+        device const float * query,
+        device char * maximum,
+        device char * minimum,
+        device const int * order,
+        device const float * mask,
+        device const char * keys,
+        device float * out,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]]) {
+    const int H=NH ? NH : a.H;
+    int c=group.x*4+sg,start=c*a.chunk,C=(a.N+a.chunk-1)/a.chunk,kv=group.y;
+    if(start>=a.N) return;
+    int count=0;
+    for(int t=start;t<min(a.N,start+a.chunk);++t) count+=isfinite(mask[order[t]]);
+    if(lane==0) out[(kv*(H+1)+H)*C+c]=count;
+    bool update=a.r && count && (start+a.chunk>=a.N || !isfinite(mask[order[start+a.chunk]]));
+    float dots[NH ? NH : 32];
+    for(int h=0;h<H;++h) dots[h]=0.f;
+    if(count && a.D%4==0) for(int d=4*lane;d<a.D;d+=128) {
+        uint64_t offset=kv*a.nb2+c*a.nb1+d*a.nb0;
+        float4 hi,lo;
+        if(update) {
+            hi=float4(-INFINITY);lo=float4(INFINITY);
+            for(int t=start;t<min(a.N,start+a.chunk);++t) {
+                if(!isfinite(mask[order[t]])) continue;
+                device const char * p=keys+order[t]*a.vb2+kv*a.vb1+d*a.vb0;
+                float4 value=a.v_f16 ? float4(*(device const half4 *)p) : *(device const float4 *)p;
+                hi=max(hi,value);lo=min(lo,value);
+            }
+            if(a.k_f16) { *(device half4 *)(maximum+offset)=half4(hi);*(device half4 *)(minimum+offset)=half4(lo); }
+            else { *(device float4 *)(maximum+offset)=hi;*(device float4 *)(minimum+offset)=lo; }
+        } else {
+            hi=a.k_f16 ? float4(*(device const half4 *)(maximum+offset)) : *(device const float4 *)(maximum+offset);
+            lo=a.k_f16 ? float4(*(device const half4 *)(minimum+offset)) : *(device const float4 *)(minimum+offset);
+        }
+        float4 sign=*(device const float4 *)(query+(kv*(H+1)+H)*a.D+d);
+        float4 key=select(-lo,hi,sign>0.f);
+        for(int h=0;h<H;++h) dots[h]+=dot(key,*(device const float4 *)(query+(kv*(H+1)+h)*a.D+d));
+    }
+    if(count && a.D%4!=0) for(int d=lane;d<a.D;d+=32) {
+        uint64_t offset=kv*a.nb2+c*a.nb1+d*a.nb0;
+        float hi,lo;
+        if(update) {
+            hi=-INFINITY;lo=INFINITY;
+            for(int t=start;t<min(a.N,start+a.chunk);++t) {
+                if(!isfinite(mask[order[t]])) continue;
+                device const char * p=keys+order[t]*a.vb2+kv*a.vb1+d*a.vb0;
+                float value=a.v_f16 ? float(*(device const half *)p) : *(device const float *)p;
+                hi=max(hi,value);lo=min(lo,value);
+            }
+            if(a.k_f16) { *(device half *)(maximum+offset)=half(hi);*(device half *)(minimum+offset)=half(lo); }
+            else { *(device float *)(maximum+offset)=hi;*(device float *)(minimum+offset)=lo; }
+        } else {
+            hi=a.k_f16 ? float(*(device const half *)(maximum+offset)) : *(device const float *)(maximum+offset);
+            lo=a.k_f16 ? float(*(device const half *)(minimum+offset)) : *(device const float *)(minimum+offset);
+        }
+        float sign=query[(kv*(H+1)+H)*a.D+d];
+        if(sign==0.f) continue;
+        float key=sign>0.f ? hi : -lo;
+        for(int h=0;h<H;++h) dots[h]+=key*query[(kv*(H+1)+h)*a.D+d];
+    }
+    for(int h=0;h<H;++h) {
+        float value=simd_sum(dots[h]);
+        if(lane==0) out[(kv*(H+1)+h)*C+c]=count ? value : -INFINITY;
+    }
+}
+typedef decltype(kernel_hsa_bounds_logits<0>) kernel_hsa_bounds_logits_t;
+template [[host_name("kernel_hsa_bounds_logits_h0")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<0>;
+template [[host_name("kernel_hsa_bounds_logits_h1")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<1>;
+template [[host_name("kernel_hsa_bounds_logits_h2")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<2>;
+template [[host_name("kernel_hsa_bounds_logits_h3")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<3>;
+template [[host_name("kernel_hsa_bounds_logits_h4")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<4>;
+template [[host_name("kernel_hsa_bounds_logits_h8")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<8>;
+template [[host_name("kernel_hsa_bounds_logits_h16")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<16>;
+template [[host_name("kernel_hsa_bounds_logits_h32")]] kernel kernel_hsa_bounds_logits_t kernel_hsa_bounds_logits<32>;

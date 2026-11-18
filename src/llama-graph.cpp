@@ -1,3 +1,4 @@
+#include "llama-hsa.h"
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -130,6 +131,33 @@ static llm_attn_mask build_attn_inp_attn_mask(
 }
 
 // impl
+
+void llm_graph_input_hsa_order::set_input(const llama_ubatch * ubatch) {
+    auto rows=mctx->get_hsa_order(*ubatch,causal,extent);
+    GGML_ASSERT(rows.size()==(size_t)order->ne[0]);
+    ggml_backend_tensor_set(order,rows.data(),0,rows.size()*sizeof(int32_t));
+}
+
+bool llm_graph_input_hsa_order::can_reuse(const llm_graph_params & params) {
+    mctx=dynamic_cast<const llama_kv_cache_context *>(params.mctx);
+    return mctx && mctx->get_n_kv()==extent &&
+        mctx->get_hsa_order_size(params.ubatch,causal,extent)==(size_t)order->ne[0];
+}
+
+void llm_graph_input_hsa_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!rows || rows_data.empty()) {
+        return;
+    }
+    GGML_ASSERT(rows->ne[0] == (int64_t) rows_data.size());
+    ggml_backend_tensor_set(rows, rows_data.data(), 0, rows_data.size() * sizeof(int32_t));
+}
+
+bool llm_graph_input_hsa_rows::can_reuse(const llm_graph_params & params) {
+    // Row tensor length is padded to Metal NCPSG; reuse as long as capacity matches.
+    GGML_UNUSED(params);
+    return rows && rows->ne[0] == (int64_t) rows_data.size();
+}
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1424,6 +1452,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_hsa_q       = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1440,16 +1469,11 @@ void llm_graph_result::reset() {
     fused_nodes.clear();
     hdmd_inputs.clear();
 
-    const size_t meta_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
-    if (meta_size != buf_compute_meta_size) {
-        // not make_unique: it would zero the whole reserve and make its pages resident
-        buf_compute_meta.reset(new uint8_t[meta_size]);
-        buf_compute_meta_size = meta_size;
-    }
+    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta_size,
-        /*.mem_buffer =*/ buf_compute_meta.get(),
+        /*.mem_size   =*/ buf_compute_meta.size(),
+        /*.mem_buffer =*/ buf_compute_meta.data(),
         /*.no_alloc   =*/ true,
     };
 
@@ -1476,6 +1500,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_hsa_q != nullptr) {
+        ggml_set_output(t_hsa_q);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -3274,7 +3301,38 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    // compute HSA only when decoding
+    const int64_t n_kv = k->ne[2];
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const int64_t D   = hparams.n_embd_head_k(il);
+    const int64_t Hq  = hparams.n_head(il);
+    const int64_t Hkv = hparams.n_head_kv(il);
+    const bool hsa_decode = cparams.hsa_topk > 0
+        && cparams.hsa_chunk > 0
+        && cparams.hsa_r > 0
+        && il >= cparams.hsa_skip_layers
+        && n_tokens == 1
+        && n_kv > cparams.hsa_topk
+        && k->ne[3] == 1
+        && !v_trans
+        && D > 0
+        && D == hparams.n_embd_head_v(il)
+        && Hkv > 0
+        && Hq % Hkv == 0
+        && q->ne[0] == D
+        && q->ne[1] == Hq
+        && kq_b == nullptr
+        && sinks == nullptr
+        && v_mla == nullptr
+        && kv_rows == nullptr
+        && kq_mask
+        && kq_mask->ne[0] == n_kv
+        && kq_mask->ne[1] == n_tokens;
+
+    ggml_tensor * cur = hsa_decode
+        ? build_hsa_decode(q, k, v, kq_mask, kq_scale, il)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3361,6 +3419,29 @@ static ggml_tensor * build_attn_scale_kv_output(
     return cur;
 }
 
+// de-quantize any quantized KV cache to be compatible with sign, multipy, max-pool, and softmax
+ggml_tensor * llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_mask, float kq_scale, int il) const {
+    ggml_tensor * order=ggml_get_tensor(ctx0,"hsa_chronological_order");
+    if(!order) {
+        if(const auto * cache=dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+            auto rows=cache->get_hsa_order(ubatch,cparams.causal_attn,k->ne[2]);
+            auto input=std::make_unique<llm_graph_input_hsa_order>(cache,cparams.causal_attn,k->ne[2]);
+            order=ggml_new_tensor_1d(ctx0,GGML_TYPE_I32,rows.size());
+            ggml_set_input(order);
+            ggml_set_name(order,"hsa_chronological_order");
+            input->order=order;
+            res->add_input(std::move(input));
+        }
+    }
+    ggml_tensor * out = build_hsa_attention(ctx0, q, k, v, kq_mask,
+            cparams.hsa_chunk, cparams.hsa_r, cparams.hsa_topk, kq_scale, nullptr, order,
+            cparams.hsa_kt_ready ? cparams.hsa_k_max[il] : nullptr,
+            cparams.hsa_kt_ready ? cparams.hsa_k_min[il] : nullptr);
+    cb(out, "hsa_kqv", il);
+    ggml_build_forward_expand(gf, out);
+    return out;
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_kv * inp,
         ggml_tensor * wo,
@@ -3423,7 +3504,38 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    const int64_t n_kv = k->ne[2];
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const int64_t D = hparams.n_embd_head_k(il);
+    const int64_t Hq = hparams.n_head(il);
+    const int64_t Hkv = hparams.n_head_kv(il);
+
+    const bool hsa = cparams.hsa_topk > 0
+        && cparams.hsa_chunk > 0
+        && cparams.hsa_r > 0
+        && il >= cparams.hsa_skip_layers
+        && n_tokens == 1
+        && n_kv > cparams.hsa_topk
+        && k->ne[3] == 1
+        && !v_trans
+        && D > 0
+        && D == hparams.n_embd_head_v(il)
+        && Hkv > 0
+        && Hq % Hkv == 0
+        && q->ne[0] == D
+        && q->ne[1] == Hq
+        && kq_b == nullptr
+        && sinks == nullptr
+        && v_mla == nullptr
+        && kv_rows == nullptr
+        && kq_mask
+        && kq_mask->ne[0] == n_kv
+        && kq_mask->ne[1] == n_tokens;
+
+    ggml_tensor * cur = hsa
+        ? build_hsa_decode(q, k, v, kq_mask, kq_scale, il)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 

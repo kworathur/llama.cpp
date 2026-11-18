@@ -564,6 +564,7 @@ extern "C" {
         GGML_OP_PAD,
         GGML_OP_PAD_REFLECT_1D,
         GGML_OP_ROLL,
+        GGML_OP_HSA,
         GGML_OP_ARANGE,
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
@@ -2490,6 +2491,19 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // RocketKV single-token HSA primitives. Q is contiguous F32 [D,Hq],
+    // K is F16/F32 [D,Hkv,N], and mask is F32 [N] with -inf for invalid rows.
+    // Packed F16 K, V and mask blocks for exact attention after per-head selection.
+    GGML_API struct ggml_tensor * ggml_hsa_gather(struct ggml_context * ctx, struct ggml_tensor * k, struct ggml_tensor * v, struct ggml_tensor * order, struct ggml_tensor * rows, struct ggml_tensor * mask);
+    GGML_API struct ggml_tensor * ggml_hsa_bounds(struct ggml_context * ctx, struct ggml_tensor * maximum, struct ggml_tensor * minimum, struct ggml_tensor * k, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk, bool last_only);
+    GGML_API struct ggml_tensor * ggml_hsa_bounds_logits(struct ggml_context * ctx, struct ggml_tensor * query, struct ggml_tensor * maximum, struct ggml_tensor * minimum, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk);
+    GGML_API struct ggml_tensor * ggml_hsa_decode_logits(struct ggml_context * ctx, struct ggml_tensor * query, struct ggml_tensor * maximum, struct ggml_tensor * minimum, struct ggml_tensor * k, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk);
+    GGML_API struct ggml_tensor * ggml_hsa_select(struct ggml_context * ctx, struct ggml_tensor * logits, int keep);
+    GGML_API struct ggml_tensor * ggml_hsa_scores(struct ggml_context * ctx, struct ggml_tensor * logits);
+    GGML_API struct ggml_tensor * ggml_hsa_compact(struct ggml_context * ctx, struct ggml_tensor * mask);
+    GGML_API struct ggml_tensor * ggml_hsa_query(struct ggml_context * ctx, struct ggml_tensor * q, int n_head_kv, int r);
+    GGML_API struct ggml_tensor * ggml_hsa_logits(struct ggml_context * ctx, struct ggml_tensor * query, struct ggml_tensor * k, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

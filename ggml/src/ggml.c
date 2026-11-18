@@ -1074,6 +1074,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "PAD",
     "PAD_REFLECT_1D",
     "ROLL",
+    "HSA",
     "ARANGE",
     "TIMESTEP_EMBEDDING",
     "ARGSORT",
@@ -1117,7 +1118,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1190,6 +1191,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "pad(x)",
     "pad_reflect_1d(x)",
     "roll(x)",
+    "hsa(x)",
     "arange(start, stop, step)",
     "timestep_embedding(timesteps, dim, max_period)",
     "argsort(x)",
@@ -1233,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5547,6 +5549,123 @@ struct ggml_tensor * ggml_top_k(
     result->src[0] = a;
 
     return result;
+}
+
+struct ggml_tensor * ggml_hsa_gather(struct ggml_context * ctx, struct ggml_tensor * k, struct ggml_tensor * v,
+        struct ggml_tensor * order, struct ggml_tensor * rows, struct ggml_tensor * mask) {
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(k,v) && k->ne[3] == 1);
+    GGML_ASSERT(order->type == GGML_TYPE_I32 && rows->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(order) && rows->nb[0] == sizeof(int32_t) && ggml_is_contiguous(mask));
+    GGML_ASSERT(order->ne[0] <= k->ne[2] && mask->ne[0] == k->ne[2] && rows->ne[1] == k->ne[1]);
+    struct ggml_tensor * out = ggml_new_tensor_1d(ctx,GGML_TYPE_F16,(2*k->ne[0]+1)*rows->ne[0]*rows->ne[1]);
+    out->op = GGML_OP_HSA;
+    out->op_params[0] = 4;
+    out->src[0] = k; out->src[1] = v; out->src[2] = order; out->src[3] = rows; out->src[4] = mask;
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_bounds(struct ggml_context * ctx, struct ggml_tensor * maximum, struct ggml_tensor * minimum,
+        struct ggml_tensor * k, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk, bool last_only) {
+    GGML_ASSERT(ggml_are_same_shape(maximum,minimum) && maximum->type == minimum->type);
+    GGML_ASSERT(maximum->type == GGML_TYPE_F16 || maximum->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(maximum->ne[0] == k->ne[0] && maximum->ne[2] == k->ne[1]);
+    GGML_ASSERT(order->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32 && order->ne[0] <= k->ne[2] && mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(chunk > 0 && maximum->ne[1] >= (order->ne[0]+chunk-1)/chunk);
+    struct ggml_tensor * out = ggml_view_tensor(ctx,maximum);
+    out->op = GGML_OP_HSA;
+    out->src[0]=maximum;out->src[1]=minimum;out->src[2]=k;out->src[3]=order;out->src[4]=mask;
+    out->op_params[0]=6;out->op_params[1]=chunk;out->op_params[2]=last_only;
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_bounds_logits(struct ggml_context * ctx, struct ggml_tensor * query, struct ggml_tensor * maximum,
+        struct ggml_tensor * minimum, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk) {
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && ggml_is_contiguous(query));
+    GGML_ASSERT(ggml_are_same_shape(maximum,minimum) && maximum->type == minimum->type);
+    GGML_ASSERT(maximum->type == GGML_TYPE_F16 || maximum->type == GGML_TYPE_F32);
+    GGML_ASSERT(query->ne[0] == maximum->ne[0] && query->ne[2] == maximum->ne[2]);
+    GGML_ASSERT(order->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32 && chunk > 0);
+    GGML_ASSERT(maximum->ne[1] >= (order->ne[0]+chunk-1)/chunk);
+    struct ggml_tensor * out = ggml_new_tensor_3d(ctx,GGML_TYPE_F32,(order->ne[0]+chunk-1)/chunk,query->ne[1],query->ne[2]);
+    out->op = GGML_OP_HSA;
+    out->src[0]=query;out->src[1]=maximum;out->src[2]=minimum;out->src[3]=order;out->src[4]=mask;
+    out->op_params[0]=7;out->op_params[1]=chunk;
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_decode_logits(struct ggml_context * ctx, struct ggml_tensor * query, struct ggml_tensor * maximum,
+        struct ggml_tensor * minimum, struct ggml_tensor * k, struct ggml_tensor * order, struct ggml_tensor * mask, int chunk) {
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->ne[0] == maximum->ne[0] && k->ne[1] == maximum->ne[2]);
+    GGML_ASSERT(order->ne[0] <= k->ne[2] && mask->ne[0] == k->ne[2]);
+    struct ggml_tensor * out = ggml_hsa_bounds_logits(ctx,query,maximum,minimum,order,mask,chunk);
+    out->op_params[0] = 8;
+    out->src[5] = k;
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_select(struct ggml_context * ctx, struct ggml_tensor * logits, int keep) {
+    GGML_ASSERT(logits->op == GGML_OP_HSA && (logits->op_params[0] == 2 || logits->op_params[0] == 7 || logits->op_params[0] == 8));
+    GGML_ASSERT(keep > 0 && keep <= logits->src[logits->op_params[0] >= 7 ? 3 : 2]->ne[0]);
+    struct ggml_tensor * out = ggml_new_tensor_2d(ctx,GGML_TYPE_I32,logits->ne[0]+keep,logits->ne[2]);
+    out->op = GGML_OP_HSA; out->src[0] = logits;
+    out->op_params[0] = 5; out->op_params[1] = keep; out->op_params[2] = logits->op_params[1];
+    out->op_params[3] = logits->src[logits->op_params[0] >= 7 ? 3 : 2]->ne[0];
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_scores(struct ggml_context * ctx, struct ggml_tensor * logits) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits) && logits->ne[3] == 1);
+    GGML_ASSERT(logits->op == GGML_OP_HSA && (logits->op_params[0] == 2 || logits->op_params[0] == 7 || logits->op_params[0] == 8));
+    struct ggml_tensor * out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, logits->src[logits->op_params[0] >= 7 ? 3 : 2]->ne[0], logits->ne[2]);
+    out->op = GGML_OP_HSA;
+    out->src[0] = logits;
+    out->op_params[0] = 3;
+    out->op_params[1] = logits->op_params[1];
+    return out;
+}
+
+// HSA uses modes 0 (compact), 1 (query metadata), and 2 (chunk logits).
+struct ggml_tensor * ggml_hsa_compact(struct ggml_context * ctx, struct ggml_tensor * mask) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 && ggml_is_contiguous(mask) && ggml_is_vector(mask));
+    struct ggml_tensor * out = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, mask->ne[0]);
+    out->op = GGML_OP_HSA;
+    out->src[0] = mask;
+    out->op_params[0] = 0;
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_query(struct ggml_context * ctx, struct ggml_tensor * q, int n_head_kv, int r) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && ggml_is_contiguous(q));
+    GGML_ASSERT(n_head_kv > 0 && q->ne[1] % n_head_kv == 0 && q->ne[2] == 1 && q->ne[3] == 1);
+    GGML_ASSERT(r > 0 && r <= q->ne[0]);
+    struct ggml_tensor * out = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1]/n_head_kv + 1, n_head_kv);
+    out->op = GGML_OP_HSA;
+    out->src[0] = q;
+    out->op_params[0] = 1;
+    out->op_params[1] = r;
+    return out;
+}
+
+struct ggml_tensor * ggml_hsa_logits(struct ggml_context * ctx, struct ggml_tensor * query, struct ggml_tensor * k,
+        struct ggml_tensor * order, struct ggml_tensor * mask, int chunk) {
+    GGML_ASSERT(query->type == GGML_TYPE_F32 && ggml_is_contiguous(query));
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT(order->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32 && ggml_is_contiguous(order) && ggml_is_contiguous(mask));
+    GGML_ASSERT(chunk > 0 && query->ne[0] == k->ne[0] && query->ne[2] == k->ne[1]);
+    GGML_ASSERT(order->ne[0] <= k->ne[2] && mask->ne[0] == k->ne[2] && k->ne[3] == 1);
+    struct ggml_tensor * out = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, (order->ne[0]+chunk-1)/chunk, query->ne[1], k->ne[1]);
+    out->op = GGML_OP_HSA;
+    out->src[0] = query;
+    out->src[1] = k;
+    out->src[2] = order;
+    out->src[3] = mask;
+    out->op_params[0] = 2;
+    out->op_params[1] = chunk;
+    return out;
 }
 
 // ggml_arange

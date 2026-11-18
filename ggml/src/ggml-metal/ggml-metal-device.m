@@ -1738,6 +1738,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+            return true;
+        case GGML_OP_HSA:
+            if (op->op_params[0] == 7 || op->op_params[0] == 8) return op->ne[1]-1 <= 32;
+            return op->op_params[0] == 0 || op->op_params[0] == 3 || op->op_params[0] >= 4 || (op->src[0]->ne[0] <= 256 && (op->op_params[0] != 2 || op->ne[1]-1 <= 32));
         case GGML_OP_ARANGE:
             return true;
         case GGML_OP_ROLL:

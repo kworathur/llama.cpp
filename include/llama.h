@@ -427,6 +427,14 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // add RocketKV params to llama context
+        // layer index up to which we use regular dense attention
+        int32_t hsa_skip_layers;
+        int32_t hsa_chunk; // chunk size, which is compression_ratio > chunk_size >= 1
+        int32_t hsa_r; // k1 in the paper, used for head dim. reduction
+        // leave this as 0 if using regular dense attention.
+        int32_t hsa_topk; // k2 in the paper, used for sequence dim. reduction
     };
 
     struct llama_model_tensor_override {
@@ -1114,6 +1122,24 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // modify llama API to specify parameters specific to HSA
+    LLAMA_API void llama_set_hsa_params(struct llama_context *ctx, int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk);
+
+    // Host-selected HSA K/V row indices (cache cell ids) for flash_attn_ext_rows decode.
+    // Pass n_rows == 0 to clear. Indices must stay valid for the current KV layout.
+    LLAMA_API void llama_set_hsa_kv_rows(struct llama_context * ctx, const int32_t * rows, int32_t n_rows);
+
+    // Rebuild the HSA KT cache (chunk-wise Kmin/Kmax) from the current KV cache.
+    // Call after Stage-1 eviction so decode can re-score every step from current Q.
+    // Bounds update automatically for single-token appends to sequence 0. Other cache changes
+    // invalidate the bounds; decode then computes HSA scores directly from the current keys.
+    LLAMA_API bool llama_hsa_kt_rebuild(struct llama_context * ctx);
+    LLAMA_API void llama_hsa_kt_clear(struct llama_context * ctx);
+
+    // Recompute HSA row ids from a single-token Q [n_head * head_dim] using the host KT.
+    // Call before each decode step (uses this Q for the next forward).
+    LLAMA_API bool llama_hsa_select_from_q(struct llama_context * ctx, const float * q_token, int32_t n_head);
 
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);

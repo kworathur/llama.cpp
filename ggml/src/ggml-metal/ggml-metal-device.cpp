@@ -2819,3 +2819,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
 
     return res;
 }
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hsa(ggml_metal_library_t lib, int mode, int heads) {
+    const char * name = mode == 0 ? "kernel_hsa_compact" : mode == 1 ? "kernel_hsa_query" : mode == 2 ? "kernel_hsa_logits" : mode == 3 ? "kernel_hsa_scores" : mode == 4 ? "kernel_hsa_gather" : mode == 5 ? "kernel_hsa_select" : mode == 6 ? "kernel_hsa_bounds" : "kernel_hsa_bounds_logits";
+    char specialized[64];
+    if (mode == 2 || mode == 7 || mode == 8) {
+        const int h = heads == 1 || heads == 2 || heads == 3 || heads == 4 || heads == 8 || heads == 16 || heads == 32 ? heads : 0;
+        snprintf(specialized,sizeof(specialized),mode>=7 ? "kernel_hsa_bounds_logits_h%d" : "kernel_hsa_logits_h%d",h);
+        name = specialized;
+    }
+    auto res = ggml_metal_library_get_pipeline(lib,name);
+    if (!res.pipeline) res = ggml_metal_library_compile_pipeline(lib,name,name,nullptr);
+    return res;
+}
